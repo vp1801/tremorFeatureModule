@@ -1,6 +1,6 @@
 generateSpectrograms = function(row, TSLICE=c(100, 100), wl=256, remTimeSlice = T, rotate = T){
   #print(row['tremorJSONFileLocation'])
-  if(is.na(as.character(row['tremorJSONFileLocation']))){
+  if(is.na(as.character(row[1,'tremorJSONFileLocation']))){
     feat = list()
     feat$acceleration = NA
     feat$timeStamp = NA
@@ -43,7 +43,9 @@ generateSpectrograms = function(row, TSLICE=c(100, 100), wl=256, remTimeSlice = 
     return(feat)
   }
   
-  feat$acceleration = correctedAcc 
+  ## band pass filter between 0.5 and 12.5 Hz
+  bandPassFilt = signal::fir1(512-1, c(0.5 * 2/obj$sampleRate, 12.5 * 2/obj$sampleRate), type="pass")
+  feat$acceleration = signal::filtfilt(bandPassFilt, correctedAcc) 
   # negative of gravity gives orientation wrt gravity or ground
   #dot product with x=0,y=0,z=1 gives angle with z axis, similarly for x and y axes
   feat$angleWithZ = -1*data$gravity$z/(rowSums(data$gravity ^ 2, na.rm=T)^0.5)
@@ -68,6 +70,12 @@ generateSpectrograms = function(row, TSLICE=c(100, 100), wl=256, remTimeSlice = 
   feat
 }
 
+interpolateSpectrum = function(specDensity, freq, interpolatedFreq)
+{
+  specFun = stats::approxfun(freq, y=specDensity)
+  specFun(interpolatedFreq)
+}
+
 frequencyFeatures = function(spectrograms, freq_range = NULL, nbins = 5, normalise = T, logScale=T, bin = NULL, tremor.activity = "", wl = 256, ovlp = 0.5){
   featureSet = Filter(function(obj) !is.na(obj$recordID), spectrograms) %>% plyr::llply(.fun = function(obj){
     if(is.null(freq_range))
@@ -75,17 +83,20 @@ frequencyFeatures = function(spectrograms, freq_range = NULL, nbins = 5, normali
     else
       freq_range[1] = max(freq_range[1], 0.1, na.rm=T)
     
-    
     tmp = tuneR::Wave(left = obj$acceleration, samp.rate = obj$sampleRate) %>% 
-      tuneR::periodogram(width=wl, overlap = ovlp*wl, frqRange = freq_range, normalize = normalise)
+      tuneR::periodogram(width=wl, overlap = ovlp*wl, normalize = normalise)
     spec = data.frame(tmp@spec)
+    
+    interpolatedFreq = seq(freq_range[1], freq_range[2], 0.05)
+    modSpec = lapply(spec, function(x) interpolateSpectrum(x, tmp@freq, interpolatedFreq = interpolatedFreq))
+    spec=data.frame(modSpec)
     #spec = abs(obj$spectrogram$S)
     colnames(spec) = paste0("tBin", 1:ncol(spec))
     if(logScale)
       spec = log(spec)
     
     #f = obj$spectrogram$f
-    f= tmp@freq
+    f= interpolatedFreq
     
     if(is.null(bin)){
       cutPoints=f
@@ -132,7 +143,12 @@ frequencyFeatures = function(spectrograms, freq_range = NULL, nbins = 5, normali
   return(featureSet)
 }
 
-ShapeTremorData = function(tremor.tbl, tremor.activity = "", freq_range=c(0.3,10), nbins=20, remove_rotation = T){
+getRecFeature = function(recSpectrum){
+  meltedDat = data.table::melt(recSpectrum, id.vars = c("recordId", "healthCode", "dataGroups", "time_slice"))
+  dcast(meltedDat, recordId + healthCode + dataGroups ~ time_slice + variable)
+}
+
+ShapeTremorData = function(tremor.tbl, tremor.activity = "", freq_range=c(0.5,12.5), nbins=20, remove_rotation = T){
   records = plyr::dlply(.data = tremor.tbl, .variables = "recordId", .parallel=T,
                               .progress = 'text',.fun = generateSpectrograms, rotate = T) %>% 
     Filter(f = function(x) !is.na(x$recordID) && !is.null(x$recordID))
@@ -197,7 +213,6 @@ getSpecDensityFeatures = function(tremor.tbl.list, remove_rotation_slice = T){
   tremor.spectral.features = plyr::join_all(feature_list, by = c("recordId"), type = "full", match="all")
   return(tremor.spectral.features)
 }
-
 
 SingleAxisFeatures <- function(x, tmp_time, varName) {
   meanX <- mean(x, na.rm = TRUE)
